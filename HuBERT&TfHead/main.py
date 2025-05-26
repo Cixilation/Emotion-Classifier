@@ -21,7 +21,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Define emotion labels
-emotion_labels = ['anger', 'happy', 'neutral', 'sad']
+emotion_labels = ['anger', 'disgust', 'fear', 'happy', 'neutral', 'sad']
 label_to_id = {label: i for i, label in enumerate(emotion_labels)}
 id_to_label = {i: label for i, label in enumerate(emotion_labels)}
 
@@ -85,13 +85,17 @@ class EmotionAudioDataset(Dataset):
         # Extract labels from paths
         self.labels = []
         for path in self.data.iloc[:, 0]:
-            if 'Anger' in path:
+            if 'anger' in path:
                 self.labels.append(label_to_id['anger'])
-            elif 'Happy' in path:
+            elif 'disgust' in path:
+                self.labels.append(label_to_id['disgust'])
+            elif 'fear' in path:
+                self.labels.append(label_to_id['fear'])
+            elif 'happy' in path:
                 self.labels.append(label_to_id['happy'])
-            elif 'Neutral' in path:
+            elif 'neutral' in path:
                 self.labels.append(label_to_id['neutral'])
-            elif 'Sad' in path:
+            elif 'sad' in path:
                 self.labels.append(label_to_id['sad'])
             else:
                 self.labels.append(0)  # Default
@@ -224,7 +228,7 @@ def collate_fn(batch):
 
 # Optimized model with mixed precision support
 class EmotionClassifier(nn.Module):
-    def __init__(self, num_classes=4, dropout_rate=0.3, hidden_size=768):
+    def __init__(self, num_classes=6, dropout_rate=0.3, hidden_size=768):
         super(EmotionClassifier, self).__init__()
         
         # Load pre-trained HuBERT model with fewer layers for speed
