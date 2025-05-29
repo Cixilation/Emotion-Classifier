@@ -3,28 +3,32 @@ import { useState, useRef } from "react";
 
 export default function Home() {
   const [detectedEmotion, setDetectedEmotion] = useState("Joyful");
-
   const [note, setNote] = useState("");
-  // State to manage recording status and audio URL
-  const [isRecording, setIsRecording] = useState(false);
-  const [audioURL, setAudioURL] = useState(null);
-  const mediaRecorder = useRef(null);
-  const audioChunks = useRef([]);
-
-  const handleFileUpload = (event) => {
+  const handleFileUpload = async (event) => {
     const file = event.target.files[0];
+    const formData = new FormData();
+    formData.append("file", file);
     if (file) {
-      setNote(file.name + " is uploaded."); 
+      setNote(file.name + " is uploaded.");
     }
+    const res = await fetch("http://localhost:8080/classify-audio", {
+      method: "POST",
+      body: formData,
+    });
+    console.log("Response status:", res.status);
+    const data = await res.json();
+    console.log(data.emotion);
   };
 
-  
   const fileInputRef = useRef(null);
-
   const triggerFileInput = () => {
     fileInputRef.current.click();
   };
 
+  const [isRecording, setIsRecording] = useState(false);
+  const [audioURL, setAudioURL] = useState(null);
+  const mediaRecorder = useRef(null);
+  const audioChunks = useRef([]);
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -48,10 +52,32 @@ export default function Home() {
       setNote("No microphone detected or the coder is just retarded.");
     }
   };
-
   const stopRecording = () => {
+    mediaRecorder.current.onstop = async () => {
+      const audioBlob = new Blob(audioChunks.current, { type: "audio/wav" });
+      const formData = new FormData();
+      formData.append("file", audioBlob, "recording.wav");
+
+      try {
+        const response = await fetch("http://localhost:8080/classify-audio", {
+          method: "POST",
+          body: formData,
+        });
+
+        const data = await response.json();
+        console.log("Emotion:", data.emotion);
+      } catch (err) {
+        console.error("Upload failed", err);
+      }
+
+      const url = URL.createObjectURL(audioBlob);
+      setAudioURL(url);
+      audioChunks.current = [];
+    };
+
     mediaRecorder.current.stop();
     setIsRecording(false);
+    streamRef.current?.getTracks().forEach((track) => track.stop());
   };
 
   return (
@@ -99,7 +125,10 @@ export default function Home() {
               id="fileInput"
             />
 
-            <button onClick={triggerFileInput}  className="flex items-center gap-2 px-5 h-12 rounded-full bg-[#402b2f] text-white font-bold cursor-pointer">
+            <button
+              onClick={triggerFileInput}
+              className="flex items-center gap-2 px-5 h-12 rounded-full bg-[#402b2f] text-white font-bold cursor-pointer"
+            >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
                 width="24"
@@ -112,13 +141,8 @@ export default function Home() {
               Upload File
             </button>
           </div>
-
         </div>
-        {note && (
-          <p className="mt-2 text-sm text-gray-300 italic">
-            {note}
-          </p>
-        )}
+        {note && <p className="mt-2 text-sm text-gray-300 italic">{note}</p>}
         <div className="mt-6">
           <h3 className="mt-4 text-lg font-bold">Emotion Detected</h3>
           <p className="mt-1 text-2xl font-extrabold text-black bg-[#ffffff] px-4 py-2 rounded-full inline-block">
