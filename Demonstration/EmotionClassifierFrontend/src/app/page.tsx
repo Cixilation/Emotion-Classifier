@@ -4,78 +4,105 @@ import { useState, useRef } from "react";
 export default function Home() {
   const [detectedEmotion, setDetectedEmotion] = useState("Joyful");
   const [note, setNote] = useState("");
-  const handleFileUpload = async (event) => {
-    const file = event.target.files[0];
-    const formData = new FormData();
-    formData.append("file", file);
-    if (file) {
-      setNote(file.name + " is uploaded.");
-    }
-    const res = await fetch("http://localhost:8080/classify-audio", {
-      method: "POST",
-      body: formData,
-    });
-    console.log("Response status:", res.status);
-    const data = await res.json();
-    console.log(data.emotion);
-  };
+  const [isRecording, setIsRecording] = useState(false);
+  const [audioURL, setAudioURL] = useState(null);
 
   const fileInputRef = useRef(null);
+  const mediaRecorder = useRef(null);
+  const audioChunks = useRef([]);
+  const streamRef = useRef(null);
+
   const triggerFileInput = () => {
     fileInputRef.current.click();
   };
 
-  const [isRecording, setIsRecording] = useState(false);
-  const [audioURL, setAudioURL] = useState(null);
-  const mediaRecorder = useRef(null);
-  const audioChunks = useRef([]);
+  const handleFileUpload = async (file) => {
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append("file", file);
+    setNote(`${file.name || "Recording"} is uploaded.`);
+
+    try {
+      const res = await fetch("http://localhost:8080/classify-audio", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+      console.log("Emotion:", data.emotion);
+      setDetectedEmotion(data.emotion);
+    } catch (err) {
+      console.error("Upload failed", err);
+      setNote("Upload failed.");
+    }
+  };
+
+  const onFileInputChange = async (event) => {
+    const file = event.target.files[0];
+    await handleFileUpload(file);
+  };
+
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorder.current = new MediaRecorder(stream);
+      streamRef.current = stream;
+
+      // Try to use WAV format, fallback to webm
+      let options = { mimeType: "audio/wav" };
+      if (!MediaRecorder.isTypeSupported("audio/wav")) {
+        options = { mimeType: "audio/webm" };
+      }
+
+      mediaRecorder.current = new MediaRecorder(stream, options);
+      audioChunks.current = [];
 
       mediaRecorder.current.ondataavailable = (event) => {
         audioChunks.current.push(event.data);
       };
 
-      mediaRecorder.current.onstop = () => {
-        const audioBlob = new Blob(audioChunks.current, { type: "audio/wav" });
+      mediaRecorder.current.onstop = async () => {
+        const mimeType = mediaRecorder.current.mimeType;
+        const audioBlob = new Blob(audioChunks.current, { type: mimeType });
+
+        // Determine file extension based on mime type
+        const extension = mimeType.includes("wav") ? "wav" : "webm";
+        const filename = `recording.${extension}`;
+
+        const formData = new FormData();
+        formData.append("file", audioBlob, filename);
+
         const url = URL.createObjectURL(audioBlob);
         setAudioURL(url);
+
+        try {
+          const response = await fetch("http://localhost:8080/classify-audio", {
+            method: "POST",
+            body: formData,
+          });
+          const data = await response.json();
+          setDetectedEmotion(data.emotion);
+          setNote("Upload successful.");
+        } catch (err) {
+          console.error("Upload failed", err);
+          setNote("Recording upload failed.");
+        }
+
         audioChunks.current = [];
       };
 
       mediaRecorder.current.start();
       setIsRecording(true);
+      setNote("Recording started...");
     } catch (err) {
       console.error("Could not start recording", err);
-      setNote("No microphone detected or the coder is just retarded.");
+      setNote("Microphone not found or permission denied.");
     }
   };
+
   const stopRecording = () => {
-    mediaRecorder.current.onstop = async () => {
-      const audioBlob = new Blob(audioChunks.current, { type: "audio/wav" });
-      const formData = new FormData();
-      formData.append("file", audioBlob, "recording.wav");
-
-      try {
-        const response = await fetch("http://localhost:8080/classify-audio", {
-          method: "POST",
-          body: formData,
-        });
-
-        const data = await response.json();
-        console.log("Emotion:", data.emotion);
-      } catch (err) {
-        console.error("Upload failed", err);
-      }
-
-      const url = URL.createObjectURL(audioBlob);
-      setAudioURL(url);
-      audioChunks.current = [];
-    };
-
-    mediaRecorder.current.stop();
+    if (mediaRecorder.current && mediaRecorder.current.state !== "inactive") {
+      mediaRecorder.current.stop();
+    }
     setIsRecording(false);
     streamRef.current?.getTracks().forEach((track) => track.stop());
   };
@@ -118,8 +145,8 @@ export default function Home() {
           <div>
             <input
               type="file"
-              accept=".wav"
-              onChange={handleFileUpload}
+              accept=".wav,.webm,.mp3"
+              onChange={onFileInputChange}
               ref={fileInputRef}
               className="hidden"
               id="fileInput"
