@@ -2,7 +2,7 @@
 import { useState, useRef } from "react";
 
 export default function Home() {
-  const [detectedEmotion, setDetectedEmotion] = useState("Joyful");
+  const [detectedEmotion, setDetectedEmotion] = useState("Are you Ready?");
   const [note, setNote] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [audioURL, setAudioURL] = useState(null);
@@ -136,11 +136,11 @@ export default function Home() {
             {isRecording ? "Stop Recording" : "Record"}
           </button>
 
-          {audioURL && (
+          {/* {audioURL && (
             <div className="mt-4">
               <audio controls src={audioURL}></audio>
             </div>
-          )}
+          )} */}
 
           <div>
             <input

@@ -8,6 +8,8 @@ import torch
 import torchaudio
 import torch.nn.functional as F
 import torch.nn as nn
+from pydub import AudioSegment
+import tempfile
 
 app = FastAPI()
 app.add_middleware(
@@ -226,22 +228,83 @@ def predict_emotion_from_waveform(waveform, sr=16000):
         print(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-def convert_and_save_audio(file_content: bytes, output_path: str) -> bool:
-    """Convert any audio format to WAV and save to file"""
+def convert_webm_to_wav(file_content: bytes) -> tuple:
+    """Convert WebM audio to WAV format using pydub"""
     try:
-        # Load audio from bytes using librosa
-        audio, sample_rate = librosa.load(io.BytesIO(file_content), sr=16000, mono=True)
+        # Create temporary files
+        with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as temp_webm:
+            temp_webm.write(file_content)
+            temp_webm_path = temp_webm.name
         
-        # Save as WAV file
-        sf.write(output_path, audio, 16000, format='wav')
-        
-        print(f"Successfully converted audio to {output_path}")
-        print(f"Audio length: {len(audio)/16000:.2f} seconds")
-        return True
-        
+        try:
+            # Load WebM using pydub (which uses FFmpeg under the hood)
+            audio = AudioSegment.from_file(temp_webm_path, format="webm")
+            
+            # Convert to mono and set sample rate to 16kHz
+            audio = audio.set_channels(1).set_frame_rate(16000)
+            
+            # Export to WAV format in memory
+            wav_buffer = io.BytesIO()
+            audio.export(wav_buffer, format="wav")
+            wav_buffer.seek(0)
+            
+            # Load the WAV data using librosa
+            audio_data, sample_rate = librosa.load(wav_buffer, sr=16000, mono=True)
+            
+            print(f"Successfully converted WebM to WAV: length={len(audio_data)/16000:.2f}s, sr={sample_rate}")
+            
+            return audio_data, sample_rate
+            
+        finally:
+            # Clean up temporary file
+            os.unlink(temp_webm_path)
+            
     except Exception as e:
-        print(f"Audio conversion error: {e}")
-        return False
+        print(f"WebM conversion error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to convert WebM audio: {str(e)}")
+
+def load_audio_from_bytes(file_content: bytes, content_type: str = None) -> tuple:
+    """Load audio from bytes with format detection"""
+    
+    # Try WebM conversion first if content type suggests it
+    if content_type and 'webm' in content_type.lower():
+        try:
+            return convert_webm_to_wav(file_content)
+        except Exception as webm_error:
+            print(f"WebM conversion failed: {webm_error}")
+    
+    # Try direct librosa loading (works for many formats)
+    try:
+        audio, sample_rate = librosa.load(io.BytesIO(file_content), sr=16000, mono=True)
+        print(f"Direct librosa loading successful: length={len(audio)/16000:.2f}s")
+        return audio, sample_rate
+    except Exception as librosa_error:
+        print(f"Direct librosa loading failed: {librosa_error}")
+    
+    # Try using pydub for other formats
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(file_content)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Try to load with pydub (auto-detects format)
+            audio = AudioSegment.from_file(temp_file_path)
+            audio = audio.set_channels(1).set_frame_rate(16000)
+            
+            # Convert to numpy array
+            audio_data = audio.get_array_of_samples()
+            audio_array = librosa.util.buf_to_float(audio_data, n_bytes=2)
+            
+            print(f"Pydub loading successful: length={len(audio_array)/16000:.2f}s")
+            return audio_array, 16000
+            
+        finally:
+            os.unlink(temp_file_path)
+            
+    except Exception as pydub_error:
+        print(f"Pydub loading failed: {pydub_error}")
+        raise HTTPException(status_code=500, detail="Unable to process audio format")
 
 # Load model when server starts
 @app.on_event("startup")
@@ -268,55 +331,20 @@ async def analyze_audio(file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
     
-    # Create upload directory
-    os.makedirs("uploaded_file", exist_ok=True)
-    wav_file_location = None
-    
     try:
         # Read file content
         file_content = await file.read()
         print(f"File size: {len(file_content)} bytes")
         
-        # Method 1: Direct prediction from bytes (faster, no file I/O)
-        try:
-            # Load audio directly from bytes
-            audio, sample_rate = librosa.load(io.BytesIO(file_content), sr=16000, mono=True)
-            print(f"Audio loaded directly: length={len(audio)/16000:.2f}s, sr={sample_rate}")
-            
-            # Predict emotion
-            result = predict_emotion_from_waveform(audio, sample_rate)
-            
-            print(f"Predicted emotion: {result['emotion']} (confidence: {result['confidence']:.3f})")
-            
-            return result
-            
-        except Exception as direct_error:
-            print(f"Direct processing failed: {direct_error}")
-            # Fall back to file-based method
-            
-            # Create filename for the WAV file
-            base_filename = os.path.splitext(file.filename)[0] if file.filename else "recording"
-            wav_file_location = f"uploaded_file/{base_filename}.wav"
-            
-            # Convert and save audio file
-            conversion_success = convert_and_save_audio(file_content, wav_file_location)
-            
-            if not conversion_success:
-                raise HTTPException(status_code=500, detail="Failed to convert audio file")
-            
-            # Check if file was created successfully
-            if not os.path.exists(wav_file_location):
-                raise HTTPException(status_code=500, detail="Audio file was not created")
-            
-            # Load audio from file
-            audio, sample_rate = librosa.load(wav_file_location, sr=16000, mono=True)
-            
-            # Predict emotion
-            result = predict_emotion_from_waveform(audio, sample_rate)
-            
-            print(f"Predicted emotion: {result['emotion']} (confidence: {result['confidence']:.3f})")
-            
-            return result
+        # Load audio with format detection
+        audio, sample_rate = load_audio_from_bytes(file_content, file.content_type)
+        
+        # Predict emotion
+        result = predict_emotion_from_waveform(audio, sample_rate)
+        
+        print(f"Predicted emotion: {result['emotion']} (confidence: {result['confidence']:.3f})")
+        
+        return result
         
     except HTTPException:
         # Re-raise HTTP exceptions
@@ -324,15 +352,6 @@ async def analyze_audio(file: UploadFile = File(...)):
     except Exception as e:
         print(f"Processing error: {e}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
-    
-    finally:
-        # Clean up the WAV file after processing
-        if wav_file_location and os.path.exists(wav_file_location):
-            try:
-                os.remove(wav_file_location)
-                print(f"Cleaned up: {wav_file_location}")
-            except Exception as cleanup_error:
-                print(f"Could not clean up {wav_file_location}: {cleanup_error}")
 
 # To run: uvicorn main:app --reload --port 8080
 if __name__ == "__main__":
