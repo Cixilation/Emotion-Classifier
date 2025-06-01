@@ -15,6 +15,11 @@ from transformers import HubertModel, AutoConfig
 from concurrent.futures import ThreadPoolExecutor
 import os
 import gc
+import multiprocessing as mp
+
+# CRITICAL: Set multiprocessing start method for Windows compatibility
+if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -29,9 +34,9 @@ id_to_label = {i: label for i, label in enumerate(emotion_labels)}
 MAX_AUDIO_LENGTH = 160000  # 10 seconds at 16kHz
 TARGET_SAMPLE_RATE = 16000
 
-# Caching mechanism for processed audio
+# Simplified caching mechanism that's worker-safe
 class AudioCache:
-    def __init__(self, cache_size=1000):
+    def __init__(self, cache_size=500):  # Reduced cache size
         self.cache = {}
         self.cache_size = cache_size
         self.cache_hits = 0
@@ -45,200 +50,187 @@ class AudioCache:
         return None
     
     def put(self, path, data):
-        # Simple LRU-like behavior - clear cache if it gets too big
-        if len(self.cache) >= self.cache_size:
-            # Keep only 75% of the cache (remove oldest entries)
-            keys_to_keep = list(self.cache.keys())[-int(self.cache_size * 0.75):]
-            new_cache = {k: self.cache[k] for k in keys_to_keep}
-            self.cache = new_cache
-        self.cache[path] = data
+        if len(self.cache) < self.cache_size:
+            self.cache[path] = data
         
     def stats(self):
         total = self.cache_hits + self.cache_misses
         hit_rate = (self.cache_hits / total) * 100 if total > 0 else 0
         return f"Cache hits: {self.cache_hits}, misses: {self.cache_misses}, hit rate: {hit_rate:.2f}%, size: {len(self.cache)}"
 
-# Global cache instance
-audio_cache = AudioCache(cache_size=5000)  # Adjust based on your memory constraints
+# Thread-local cache to avoid sharing between workers
+import threading
+thread_local = threading.local()
 
-# Feature extraction is done once during dataset preparation
+def get_thread_cache():
+    if not hasattr(thread_local, 'cache'):
+        thread_local.cache = AudioCache(cache_size=200)  # Smaller per-thread cache
+    return thread_local.cache
+
+# Feature extraction - moved outside class to avoid pickling issues
 from transformers import Wav2Vec2FeatureExtractor
-global_processor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/hubert-base-ls960")
 
-# Custom Dataset with optimizations
+def get_global_processor():
+    return Wav2Vec2FeatureExtractor.from_pretrained("facebook/hubert-base-ls960")
+
+# Standalone audio loading function for multiprocessing compatibility
+def load_audio_standalone(audio_path):
+    """Standalone function for loading audio that can be pickled"""
+    try:
+        if not os.path.exists(audio_path):
+            return None
+            
+        # Use librosa for more reliable loading across different formats
+        waveform, sample_rate = librosa.load(audio_path, sr=TARGET_SAMPLE_RATE)
+        waveform = torch.tensor(waveform, dtype=torch.float32)
+        
+        # Truncate or pad to standard length
+        if len(waveform) > MAX_AUDIO_LENGTH:
+            waveform = waveform[:MAX_AUDIO_LENGTH]
+        elif len(waveform) < MAX_AUDIO_LENGTH:
+            # Zero padding
+            padding = torch.zeros(MAX_AUDIO_LENGTH - len(waveform))
+            waveform = torch.cat([waveform, padding], dim=0)
+        
+        return waveform
+    except Exception as e:
+        print(f"Error loading {audio_path}: {e}")
+        return None
+
+# Simplified Dataset class
 class EmotionAudioDataset(Dataset):
-    def __init__(self, csv_file, transform=None, preload=False, preprocess_workers=4):
+    def __init__(self, csv_file, transform=None):
         """
-        Args:
-            csv_file (string): Path to the csv file with annotations.
-            transform (callable, optional): Optional transform to be applied on a sample.
-            preload (bool): Whether to preload all audio files (for small datasets).
-            preprocess_workers (int): Number of workers for preprocessing (if preload=True).
+        Simplified dataset without preloading to avoid worker issues
         """
         self.data = pd.read_csv(csv_file)
-        self.processor = global_processor  # Use the global processor
         self.transform = transform
-        self.invalid_files = set()
-        self.preload = preload
-        self.preloaded_data = {}
         
         # Extract labels from paths
         self.labels = []
         for path in self.data.iloc[:, 0]:
-            if 'anger' in path:
+            path_lower = path.lower()
+            if 'anger' in path_lower:
                 self.labels.append(label_to_id['anger'])
-            elif 'disgust' in path:
+            elif 'disgust' in path_lower:
                 self.labels.append(label_to_id['disgust'])
-            elif 'fear' in path:
+            elif 'fear' in path_lower:
                 self.labels.append(label_to_id['fear'])
-            elif 'happy' in path:
+            elif 'happy' in path_lower:
                 self.labels.append(label_to_id['happy'])
-            elif 'neutral' in path:
+            elif 'neutral' in path_lower:
                 self.labels.append(label_to_id['neutral'])
-            elif 'sad' in path:
+            elif 'sad' in path_lower:
                 self.labels.append(label_to_id['sad'])
             else:
-                self.labels.append(0)  # Default
+                print(f"Unknown label found in path: {path}")
+                self.labels.append(0)  # Default to first class
         
-        # Preload data if specified (for small datasets)
-        if preload:
-            print(f"Preloading dataset with {preprocess_workers} workers...")
-            with ThreadPoolExecutor(max_workers=preprocess_workers) as executor:
-                paths = self.data.iloc[:, 0].tolist()
-                audio_data = list(tqdm(executor.map(self._load_audio, paths), total=len(paths)))
-                self.preloaded_data = {path: data for path, data in zip(paths, audio_data) if data is not None}
-            print(f"Preloaded {len(self.preloaded_data)} valid audio files out of {len(paths)}")
+        print(f"Dataset initialized with {len(self.data)} samples")
         
-    def _load_audio(self, audio_path):
-        try:
-            # Check cache first
-            cached_data = audio_cache.get(audio_path)
-            if cached_data is not None:
-                return cached_data
-            
-            # Load and preprocess audio
-            import os
-            if not os.path.exists(audio_path):
-                return None
-                
-            # Use torchaudio for faster loading when possible
-            try:
-                waveform, sample_rate = torchaudio.load(audio_path)
-                
-                # Convert to mono if stereo
-                if waveform.shape[0] > 1:
-                    waveform = torch.mean(waveform, dim=0, keepdim=True)
-                
-                # Resample if needed
-                if sample_rate != TARGET_SAMPLE_RATE:
-                    resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=TARGET_SAMPLE_RATE)
-                    waveform = resampler(waveform)
-            except:
-                # Fallback to librosa
-                waveform, sample_rate = librosa.load(audio_path, sr=TARGET_SAMPLE_RATE)
-                waveform = torch.tensor(waveform).unsqueeze(0)
-            
-            # Truncate or pad to standard length
-            if waveform.shape[1] > MAX_AUDIO_LENGTH:
-                waveform = waveform[:, :MAX_AUDIO_LENGTH]
-            elif waveform.shape[1] < MAX_AUDIO_LENGTH:
-                # Zero padding
-                padding = torch.zeros(1, MAX_AUDIO_LENGTH - waveform.shape[1])
-                waveform = torch.cat([waveform, padding], dim=1)
-            
-            result = waveform.squeeze(0)
-            # Store in cache
-            audio_cache.put(audio_path, result)
-            return result
-        except Exception as e:
-            return None
-    
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-            
         try:
-            audio_path = self.data.iloc[idx, 0]  # Assuming first column is the file path
+            audio_path = self.data.iloc[idx, 0]
             label_id = self.labels[idx]
             
-            # Get preloaded or cached data if available
-            if self.preload and audio_path in self.preloaded_data:
-                waveform = self.preloaded_data[audio_path]
-            else:
-                waveform = self._load_audio(audio_path)
+            # Get thread-local cache
+            cache = get_thread_cache()
+            
+            # Try cache first
+            waveform = cache.get(audio_path)
+            if waveform is None:
+                waveform = load_audio_standalone(audio_path)
+                if waveform is not None:
+                    cache.put(audio_path, waveform)
             
             # Handle invalid files
             if waveform is None:
-                if audio_path not in self.invalid_files:
-                    self.invalid_files.add(audio_path)
-                # Return a dummy waveform
-                waveform = torch.zeros(MAX_AUDIO_LENGTH)
+                waveform = torch.zeros(MAX_AUDIO_LENGTH, dtype=torch.float32)
+                label_id = 0  # Default label for invalid files
             
             # Apply transform if specified
             if self.transform:
                 waveform = self.transform(waveform)
             
-            return {'waveform': waveform, 'label': label_id, 'path': audio_path}
+            return {
+                'waveform': waveform,
+                'label': label_id,
+                'path': audio_path
+            }
                 
         except Exception as e:
+            print(f"Error in __getitem__ for idx {idx}: {e}")
             # Return a dummy sample as fallback
-            return {'waveform': torch.zeros(MAX_AUDIO_LENGTH), 'label': 0, 'path': 'error_path'}
+            return {
+                'waveform': torch.zeros(MAX_AUDIO_LENGTH, dtype=torch.float32),
+                'label': 0,
+                'path': 'error_path'
+            }
 
-# Batched processing for feature extraction
-def batch_process_features(waveforms, sampling_rate=16000):
-    """Process a batch of waveforms with the feature extractor"""
-    with torch.no_grad():
-        inputs = global_processor(waveforms, sampling_rate=sampling_rate, padding=True, return_tensors="pt")
-    return inputs
-
-# Optimized collate function for batching
+# Simplified collate function
 def collate_fn(batch):
     """
-    Optimized collate function that processes features in batch mode.
+    Simplified collate function that's more robust
     """
     try:
-        # Get waveforms and labels
-        waveforms = [item['waveform'].numpy() for item in batch]
-        labels = torch.tensor([item['label'] for item in batch])
-        paths = [item['path'] for item in batch]
+        # Initialize processor here to avoid pickling issues
+        processor = get_global_processor()
         
-        # Batch process features
-        inputs = batch_process_features(waveforms)
+        # Get waveforms and labels
+        waveforms = []
+        labels = []
+        paths = []
+        
+        for item in batch:
+            if item['waveform'] is not None and len(item['waveform']) == MAX_AUDIO_LENGTH:
+                waveforms.append(item['waveform'].numpy())
+                labels.append(item['label'])
+                paths.append(item['path'])
+        
+        if len(waveforms) == 0:
+            # Return dummy batch if all samples are invalid
+            dummy_waveforms = [np.zeros(MAX_AUDIO_LENGTH, dtype=np.float32) for _ in range(len(batch))]
+            dummy_labels = [0] * len(batch)
+            dummy_paths = ['dummy'] * len(batch)
+            waveforms, labels, paths = dummy_waveforms, dummy_labels, dummy_paths
+        
+        # Process features
+        inputs = processor(waveforms, sampling_rate=TARGET_SAMPLE_RATE, padding=True, return_tensors="pt")
         
         return {
             'input_values': inputs.input_values,
             'attention_mask': inputs.attention_mask if hasattr(inputs, 'attention_mask') else None,
-            'labels': labels,
+            'labels': torch.tensor(labels, dtype=torch.long),
             'paths': paths
         }
     except Exception as e:
         print(f"Error in collate_fn: {e}")
-        # Return a minimal batch to prevent crash
-        dummy_inputs = torch.zeros((len(batch), MAX_AUDIO_LENGTH))
-        dummy_labels = torch.zeros(len(batch), dtype=torch.long)
+        # Return minimal valid batch
+        batch_size = len(batch)
+        dummy_inputs = torch.zeros((batch_size, MAX_AUDIO_LENGTH), dtype=torch.float32)
+        dummy_labels = torch.zeros(batch_size, dtype=torch.long)
         return {
             'input_values': dummy_inputs,
             'attention_mask': None,
             'labels': dummy_labels,
-            'paths': ["error"] * len(batch)
+            'paths': ["error"] * batch_size
         }
 
-# Optimized model with mixed precision support
+# Optimized model (same as before but with some memory optimizations)
 class EmotionClassifier(nn.Module):
-    def __init__(self, num_classes=6, dropout_rate=0.3, hidden_size=768):
+    def __init__(self, num_classes=6, dropout_rate=0.3):
         super(EmotionClassifier, self).__init__()
         
-        # Load pre-trained HuBERT model with fewer layers for speed
+        # Load pre-trained HuBERT model with fewer layers for speed and memory
         config = AutoConfig.from_pretrained("facebook/hubert-base-ls960")
-        # Reduce number of encoder layers for faster training
-        config.num_hidden_layers = 6  # Half of the original 12 layers
+        config.num_hidden_layers = 4  # Further reduced for RTX 4060 Ti
         self.hubert_model = HubertModel.from_pretrained("facebook/hubert-base-ls960", config=config)
         
-        # Optional: Freeze some early layers
-        modules = list(self.hubert_model.encoder.layers.children())[:3]  # Freeze first 3 layers
+        # Freeze more layers to reduce memory usage
+        modules = list(self.hubert_model.encoder.layers.children())[:2]  # Freeze first 2 layers
         for module in modules:
             for param in module.parameters():
                 param.requires_grad = False
@@ -246,20 +238,20 @@ class EmotionClassifier(nn.Module):
         # Get hidden size from HuBERT
         hidden_size = self.hubert_model.config.hidden_size
         
-        # Lightweight attention pooling instead of transformer encoder
+        # Simplified attention pooling
         self.attention = nn.Sequential(
-            nn.Linear(hidden_size, 128),
+            nn.Linear(hidden_size, 64),  # Reduced size
             nn.Tanh(),
-            nn.Linear(128, 1),
+            nn.Linear(64, 1),
             nn.Softmax(dim=1)
         )
         
-        # Classification head
+        # Simplified classification head
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_size, 256),
+            nn.Linear(hidden_size, 128),  # Reduced size
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(256, num_classes)
+            nn.Linear(128, num_classes)
         )
         
     def forward(self, input_values, attention_mask=None):
@@ -271,18 +263,18 @@ class EmotionClassifier(nn.Module):
         )
         
         # Get the hidden states
-        hidden_states = outputs.last_hidden_state  # [batch_size, sequence_length, hidden_size]
+        hidden_states = outputs.last_hidden_state
         
         # Apply attention pooling
-        attention_weights = self.attention(hidden_states)  # [batch_size, sequence_length, 1]
-        context_vector = torch.sum(hidden_states * attention_weights, dim=1)  # [batch_size, hidden_size]
+        attention_weights = self.attention(hidden_states)
+        context_vector = torch.sum(hidden_states * attention_weights, dim=1)
         
         # Classification
         logits = self.classifier(context_vector)
         
         return logits
 
-# Training function with mixed precision and optimization
+# Training function with better error handling
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=10, patience=3, 
                 grad_accum_steps=2, mixed_precision=True, scheduler_type='cosine'):
     best_val_loss = float('inf')
@@ -301,12 +293,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     elif scheduler_type == 'plateau':
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1)
-    elif scheduler_type == 'warmup':
-        from transformers import get_cosine_schedule_with_warmup
-        num_training_steps = len(train_loader) // grad_accum_steps * num_epochs
-        num_warmup_steps = int(0.1 * num_training_steps)  # 10% of total steps for warmup
-        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, 
-                                                   num_training_steps=num_training_steps)
     
     print(f"Starting training with mixed precision: {mixed_precision}, gradient accumulation steps: {grad_accum_steps}")
     
@@ -317,7 +303,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         all_preds = []
         all_labels = []
         valid_batches = 0
-        optimizer.zero_grad()  # Zero gradients at start of epoch
+        optimizer.zero_grad()
         
         # Use tqdm for progress bar
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
@@ -328,68 +314,52 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 attention_mask = batch['attention_mask'].to(device) if batch['attention_mask'] is not None else None
                 labels = batch['labels'].to(device)
                 
+                # Skip batch if it contains invalid data
+                if input_values.shape[0] == 0:
+                    continue
+                
                 # Mixed precision forward pass
                 if mixed_precision and torch.cuda.is_available():
                     with torch.cuda.amp.autocast():
                         outputs = model(input_values, attention_mask)
                         loss = criterion(outputs, labels)
-                        # Scale loss by gradient accumulation steps
                         loss = loss / grad_accum_steps
                     
-                    # Scale gradients and backprop
                     scaler.scale(loss).backward()
                     
-                    # Step every grad_accum_steps or at the end of an epoch
                     if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_loader):
-                        # Unscale before clipping
                         scaler.unscale_(optimizer)
-                        # Gradient clipping
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        # Optimizer step with scaler
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
-                        
-                        # Update LR scheduler if using warmup
-                        if scheduler_type == 'warmup':
-                            scheduler.step()
                 else:
-                    # Standard precision training
                     outputs = model(input_values, attention_mask)
                     loss = criterion(outputs, labels)
                     loss = loss / grad_accum_steps
                     
-                    # Backward pass
                     loss.backward()
                     
-                    # Step every grad_accum_steps or at the end of an epoch
                     if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_loader):
-                        # Gradient clipping
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
                         optimizer.zero_grad()
-                        
-                        # Update LR scheduler if using warmup
-                        if scheduler_type == 'warmup':
-                            scheduler.step()
                 
-                # Track statistics (use the unscaled loss)
                 running_loss += loss.item() * grad_accum_steps
                 valid_batches += 1
                 
-                # Get predictions for accuracy calculation
                 with torch.no_grad():
                     _, predicted = torch.max(outputs.data, 1)
                     all_preds.extend(predicted.cpu().numpy())
                     all_labels.extend(labels.cpu().numpy())
                 
-                # Update progress bar
                 pbar.set_postfix({
                     'loss': loss.item() * grad_accum_steps,
                     'batch_acc': (predicted == labels).sum().item() / len(labels)
                 })
+                
             except Exception as e:
-                print(f"Error during training batch: {e}")
+                print(f"Error during training batch {i}: {e}")
                 continue
         
         if valid_batches == 0:
@@ -402,9 +372,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         train_accuracies.append(epoch_acc)
         
         print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
-        
-        # Print cache stats
-        print(audio_cache.stats())
         
         # Validation phase
         model.eval()
@@ -420,7 +387,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                     attention_mask = batch['attention_mask'].to(device) if batch['attention_mask'] is not None else None
                     labels = batch['labels'].to(device)
                     
-                    # Mixed precision validation (optional)
+                    if input_values.shape[0] == 0:
+                        continue
+                    
                     if mixed_precision and torch.cuda.is_available():
                         with torch.cuda.amp.autocast():
                             outputs = model(input_values, attention_mask)
@@ -466,8 +435,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
+        
+        # Memory cleanup
+        gc.collect()
+        torch.cuda.empty_cache()
     
-    # Plot training and validation metrics
+    # Plot training metrics
     if len(train_losses) > 0 and len(val_losses) > 0:
         plt.figure(figsize=(12, 5))
         plt.subplot(1, 2, 1)
@@ -492,7 +465,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     
     return best_model_path
 
-# Evaluation function with optimizations
+# Evaluation function
 def evaluate_model(model, test_loader, criterion, mixed_precision=True):
     model.eval()
     test_loss = 0.0
@@ -501,71 +474,82 @@ def evaluate_model(model, test_loader, criterion, mixed_precision=True):
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating"):
-            input_values = batch['input_values'].to(device)
-            attention_mask = batch['attention_mask'].to(device) if batch['attention_mask'] is not None else None
-            labels = batch['labels'].to(device)
-            
-            # Mixed precision evaluation (optional)
-            if mixed_precision and torch.cuda.is_available():
-                with torch.cuda.amp.autocast():
+            try:
+                input_values = batch['input_values'].to(device)
+                attention_mask = batch['attention_mask'].to(device) if batch['attention_mask'] is not None else None
+                labels = batch['labels'].to(device)
+                
+                if input_values.shape[0] == 0:
+                    continue
+                
+                if mixed_precision and torch.cuda.is_available():
+                    with torch.cuda.amp.autocast():
+                        outputs = model(input_values, attention_mask)
+                        loss = criterion(outputs, labels)
+                else:
                     outputs = model(input_values, attention_mask)
                     loss = criterion(outputs, labels)
-            else:
-                outputs = model(input_values, attention_mask)
-                loss = criterion(outputs, labels)
-            
-            test_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+                
+                test_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+            except Exception as e:
+                print(f"Error during evaluation: {e}")
+                continue
     
     # Calculate metrics
-    test_loss = test_loss / len(test_loader)
-    accuracy = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='weighted')
+    test_loss = test_loss / len(test_loader) if len(test_loader) > 0 else 0
+    accuracy = accuracy_score(all_labels, all_preds) if len(all_preds) > 0 else 0
+    f1 = f1_score(all_labels, all_preds, average='weighted') if len(all_preds) > 0 else 0
     
     # Create confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
+    if len(all_preds) > 0:
+        cm = confusion_matrix(all_labels, all_preds)
+        
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=emotion_labels, 
+                    yticklabels=emotion_labels)
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title('Confusion Matrix')
+        plt.tight_layout()
+        plt.savefig('confusion_matrix.png')
+        plt.show()
+    else:
+        cm = np.zeros((len(emotion_labels), len(emotion_labels)))
     
     print(f"Test Loss: {test_loss:.4f}")
     print(f"Test Accuracy: {accuracy:.4f}")
     print(f"Test F1 Score: {f1:.4f}")
     
-    # Plot confusion matrix
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=emotion_labels, 
-                yticklabels=emotion_labels)
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title('Confusion Matrix')
-    plt.tight_layout()
-    plt.savefig('confusion_matrix.png')
-    plt.show()
-    
     return test_loss, accuracy, f1, cm
 
-# Main function with optimizations
+# Main function
 def main():  
+    # Clear everything
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     # Set random seeds for reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
-    torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuner
-    
-    # Enable deterministic algorithms for reproducibility if needed
-    # torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = True
     
     # Data path
     csv_file = "labeled_data.csv"
     
-    # RTX 4060 has 8GB VRAM, optimize batch size and model size accordingly
-    batch_size = 16  # Increased batch size
-    mixed_precision = True  # Enable mixed precision training
-    grad_accum_steps = 4  # Accumulate gradients for larger effective batch size
-    num_workers = 4  # Parallel data loading
+    # Optimized settings for RTX 4060 Ti with large dataset
+    batch_size = 4  # Reduced for stability with large dataset
+    mixed_precision = True
+    grad_accum_steps = 8  # Increased to maintain effective batch size
+    num_workers = 0  # Set to 0 to avoid multiprocessing issues
+    
+    print(f"Creating dataset from {csv_file}")
     
     # Create dataset
-    dataset = EmotionAudioDataset(csv_file, preload=False)  # Set preload=True for small datasets
+    dataset = EmotionAudioDataset(csv_file)
     
     # Split dataset
     total_size = len(dataset)
@@ -582,16 +566,15 @@ def main():
     print(f"Validation set size: {len(val_dataset)}")
     print(f"Test set size: {len(test_dataset)}")
     
-    # Create DataLoaders
+    # Create DataLoaders with num_workers=0 to avoid multiprocessing issues
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
         collate_fn=collate_fn, 
         num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,  # Drop last batch to avoid issues with batch norm
-        persistent_workers=True  # Keep workers alive between epochs
+        pin_memory=False,  # Disabled for stability
+        drop_last=True
     )
     val_loader = DataLoader(
         val_dataset, 
@@ -599,8 +582,7 @@ def main():
         shuffle=False, 
         collate_fn=collate_fn, 
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True
+        pin_memory=False
     )
     test_loader = DataLoader(
         test_dataset, 
@@ -608,53 +590,51 @@ def main():
         shuffle=False, 
         collate_fn=collate_fn, 
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=False
     )
     
-    # Initialize model with optimizations
+    # Initialize model
     model = EmotionClassifier(num_classes=len(emotion_labels)).to(device)
     
-    # Print model summary and parameter count
+    # Print model info
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
-    # Optimizer with weight decay
+    # Optimizer
     optimizer = optim.AdamW(
         [
-            {'params': model.hubert_model.parameters(), 'lr': 1e-5},  # Lower LR for pretrained
-            {'params': model.attention.parameters(), 'lr': 3e-4},
-            {'params': model.classifier.parameters(), 'lr': 3e-4}
+            {'params': model.hubert_model.parameters(), 'lr': 5e-6},  # Very low LR for pretrained
+            {'params': model.attention.parameters(), 'lr': 1e-4},
+            {'params': model.classifier.parameters(), 'lr': 1e-4}
         ],
         weight_decay=0.01
     )
     
-    # Loss function with label smoothing for regularization
+    # Loss function
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    # Train model with optimizations
+    # Train model
     best_model_path = train_model(
         model, 
         train_loader, 
         val_loader, 
         criterion, 
         optimizer,
-        num_epochs=10,
-        patience=3,
+        num_epochs=50,  # Reduced for initial testing
+        patience=5,
         grad_accum_steps=grad_accum_steps,
         mixed_precision=mixed_precision,
-        scheduler_type='warmup'  # Options: 'cosine', 'plateau', 'warmup'
+        scheduler_type='cosine'
     )
     
-    # Clear memory before evaluation
+    # Clear memory
     gc.collect()
     torch.cuda.empty_cache()
     
-    # Load best model for evaluation
+    # Load best model and evaluate
     model.load_state_dict(torch.load(best_model_path))
-    
-    # Evaluate on test set
     test_loss, test_acc, test_f1, cm = evaluate_model(model, test_loader, criterion, mixed_precision=mixed_precision)
     
     print("Training and evaluation complete!")
@@ -662,7 +642,7 @@ def main():
     print(f"Test accuracy: {test_acc:.4f}")
     print(f"Test F1 score: {test_f1:.4f}")
     
-    # Save final model with metadata
+    # Save final model
     torch.save({
         'model_state_dict': model.state_dict(),
         'class_mapping': id_to_label,
@@ -676,6 +656,6 @@ def main():
     }, 'emotion_classifier_final.pth')
     
     print("Final model saved to: emotion_classifier_final.pth")
-    
+
 if __name__ == "__main__":
     main()

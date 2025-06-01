@@ -1,2 +1,6 @@
 /Dataset
 /FixedDataset
+FixedDataset.zip
+HuBERT&TfHead/SR.zip
+HuBERT&TfHead/best_emotion_model.pth
+HuBERT&TfHead/emotion_classifier_final.pth
